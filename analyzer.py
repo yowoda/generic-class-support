@@ -75,6 +75,9 @@ class GenericClassVisitor(cst.CSTVisitor):
             self._typevar_name = f"{name}.TypeVar"
         
     def visit_ImportFrom(self, node: cst.ImportFrom):
+        if node.module is None:
+            return
+        
         if node.module.value != "typing":
             return
         
@@ -226,7 +229,14 @@ else:
     get_generic_classes = _get_ast_generic_classes
 
 def compare_files(path_to_impl: Path, path_to_stub: Path, *, fix: bool) -> None:
-    generic_classes = get_generic_classes(path_to_stub)
+    _log(f"Comparing {path_to_stub} with {path_to_impl}")
+    try:
+        generic_classes = get_generic_classes(path_to_stub)
+
+    except:
+        _log(f"Could not parse {path_to_stub}. Skipping.")
+        return
+    
     if not generic_classes:
         _log(f"{path_to_stub} does not contain any generic classes. Skipping.")
         return
