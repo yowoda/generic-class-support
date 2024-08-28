@@ -1,3 +1,9 @@
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#     "libcst",
+# ]
+# ///
 # pyright: strict
 
 import argparse
@@ -7,7 +13,7 @@ import os
 import typing as t
 from pathlib import Path
 
-import ast
+import libcst as cst
 
 IGNORE_NAMES: t.Sequence[str] = (
     "__pycache__"
@@ -25,6 +31,156 @@ parser.add_argument("-v", "--verbose", required=False, action="store_true", help
 
 args = parser.parse_args()
 
+class GenericClassVisitor(cst.CSTVisitor):
+    __slots__: t.Sequence[str] = ("_generic_class_names", "_typevar_name", "_typevars")
+
+    def __init__(self) -> None:
+        self._generic_class_names: list[str] = []
+        self._typevar_name: str = ""
+        self._typevars: list[str] = []
+
+    @property
+    def generic_class_names(self) -> list[str]:
+        return self._generic_class_names
+
+    def visit_Assign(self, node: cst.Assign) -> None:
+        # Can't create a type variable if TypeVar wasn't imported
+        if self._typevar_name == "": return
+
+        if not isinstance(node.value, cst.Call):
+            return
+        
+        var_name = t.cast(str, node.targets[0].target.value)
+        
+        func = node.value.func
+        # Can't create a type variable using dot notation and from typing import TypeVar at the same time
+        if isinstance(func, cst.Attribute):
+            if "." not in self._typevar_name:
+                return
+            
+            module, name = self._typevar_name.split(".")
+            if (func.value.value, func.attr.value) == (module, name): # typevar call matches type var import
+                self._typevars.append(var_name)
+
+        elif isinstance(func, cst.Name):
+            if func.value != self._typevar_name:
+                return
+            
+            self._typevars.append(var_name)
+
+
+    def visit_Import(self, node: cst.Import) -> None:
+        name = self._find_TypeVar(node, "typing")
+        if name is not None:
+            self._typevar_name = f"{name}.TypeVar"
+        
+    def visit_ImportFrom(self, node: cst.ImportFrom):
+        if node.module.value != "typing":
+            return
+        
+        if isinstance(node.names, cst.ImportStar):
+            self._typevar_name = "TypeVar"    
+
+        else:
+            name = self._find_TypeVar(node, "TypeVar")
+            if name is not None:
+                self._typevar_name = name
+
+    def _find_TypeVar(self, node: t.Union[cst.Import, cst.ImportFrom], namespace: str) -> t.Optional[str]:
+        assert not isinstance(node.names, cst.ImportStar)
+        for alias in node.names:
+            origin_name = t.cast(str, alias.name.value)
+            if origin_name != namespace:
+                continue
+
+            if alias.asname is not None:
+                origin_name = cst.ensure_type(alias.asname.name, cst.Name).value
+
+            return origin_name
+
+    def visit_ClassDef(self, node: cst.ClassDef) -> None:
+        # class uses type parameter syntax so it's generic
+        if node.type_parameters is not None:
+            self._generic_class_names.append(node.name.value)
+
+        else: # Check if the bases contain type subscripts using previously declared TypeVars
+            for base in node.bases:
+                if not isinstance(base.value, cst.Subscript):
+                    continue
+
+                slice_ = base.value.slice
+                for subscript in slice_:
+                    if subscript.slice.value.value in self._typevars:
+                        self._generic_class_names.append(node.name.value)
+                        return
+                    
+
+class FileTransformer(cst.CSTTransformer):
+    __slots__: t.Sequence[str] = ("_generic_class_names", "_generic_alias_cls")
+
+    def __init__(self, generic_class_names: list[str]) -> None:
+        self._generic_class_names = generic_class_names
+        self._generic_alias_cls: str = ""
+
+    def visit_Import(self, node: cst.Import) -> None:
+        name = self._find_GenericAlias(node, "types")
+        if name is not None:
+            self._generic_alias_cls = f"{name}.GenericAlias"
+        
+    def visit_ImportFrom(self, node: cst.ImportFrom):
+        if node.module.value != "types":
+            return
+        
+        if isinstance(node.names, cst.ImportStar):
+            self._generic_alias_cls = "GenericAlias"    
+
+        else:
+            name = self._find_GenericAlias(node, "GenericAlias")
+            if name is not None:
+                self._generic_alias_cls = name
+
+    def _find_GenericAlias(self, node: t.Union[cst.Import, cst.ImportFrom], namespace: str) -> t.Optional[str]:
+        assert not isinstance(node.names, cst.ImportStar)
+        for alias in node.names:
+            origin_name = t.cast(str, alias.name.value)
+            if origin_name != namespace:
+                continue
+
+            if alias.asname is not None:
+                origin_name = cst.ensure_type(alias.asname.name, cst.Name).value
+
+            return origin_name
+
+    def leave_ClassDef(self, original_node: cst.ClassDef, updated_node: cst.ClassDef) -> t.Union[cst.ClassDef, cst.FlattenSentinel]:
+        #print(dump(updated_node))
+        if original_node.name.value in self._generic_class_names:
+            _import_stmt: t.Optional[bool] = None
+
+            if self._generic_alias_cls == "":
+                _import_stmt = cst.parse_statement("from types import GenericAlias")
+                self._generic_alias_cls = "GenericAlias"
+                
+            __class_getitem__Node = cst.parse_statement(
+                f"__class_getitem__ = classmethod({self._generic_alias_cls})"
+            )
+            statements = original_node.body.body
+            if isinstance(original_node.body, cst.SimpleStatementSuite):
+                statements = [cst.SimpleStatementLine(statements)]
+
+            updated_node = updated_node.with_changes(
+                body=cst.IndentedBlock(
+                    body=(
+                        *statements,
+                        __class_getitem__Node
+                    )
+                )
+            )
+
+            if _import_stmt is not None:
+                return cst.FlattenSentinel((_import_stmt, updated_node))
+        
+        return updated_node
+
 def _convert_to_module_path(path: Path, ext: str) -> str:
     return ".".join(path.parts).rstrip(ext)
 
@@ -32,9 +188,9 @@ def _log(message: str) -> None:
     if args.verbose is True:
         print(message)
 
-def _get_ast(p: Path) -> ast.Module:
+def _get_ast(p: Path) -> cst.Module:
     with open(str(p)) as f:
-        return ast.parse(f.read())
+        return cst.parse_module(f.read())
 
 def _get_runtime_generic_classes(path: Path) -> list[str]:
     stubs_import_path = _convert_to_module_path(path, ".pyi")
@@ -53,18 +209,11 @@ def _get_runtime_generic_classes(path: Path) -> list[str]:
     return generic_classes
 
 def _get_ast_generic_classes(path: Path) -> list[str]:
-    generic_classes: list[str] = []
-
-    class NodeVisitor(ast.NodeVisitor):
-        def visit_ClassDef(self, node: ast.ClassDef) -> None:
-            if node.type_params:
-                generic_classes.append(node.name)
-
     tree = _get_ast(path)
-    visitor = NodeVisitor()
-    visitor.visit(tree)
+    visitor = GenericClassVisitor()
+    tree.visit(visitor)
 
-    return generic_classes
+    return visitor.generic_class_names
 
 if args.runtime:
     import sys
@@ -108,49 +257,10 @@ def compare_files(path_to_impl: Path, path_to_stub: Path, *, fix: bool) -> None:
     elif fix is True:
         _log(f"--fix is enabled, will be fixing the following classes: {', '.join(non_subscriptable_classes)}")
         tree = _get_ast(path_to_impl)
-
-        class NodeVisitor(ast.NodeVisitor):
-            types_import: str = ""
-            __class_getitem__Node: t.Optional[ast.Assign]
-
-            def visit_Module(self, node: ast.Module):
-                pos: int = 0
-                while pos < len(node.body):
-                    stmt = node.body[pos]
-                    if isinstance(stmt, ast.Import):
-                        for alias in stmt.names:
-                            if alias.name != "types":
-                                break
-                            
-                            if alias.asname is not None:
-                                self.types_import = alias.asname
-
-                            else:
-                                self.types_import = alias.name
-
-                            self._Build__class_getitem_Node()
-
-                    elif self.types_import == "":
-                        self.types_import = "types"
-                        node.body.insert(pos, ast.parse(f"import {self.types_import}").body[0])
-                        pos += 1
-                        self._Build__class_getitem_Node()
-
-                    self.visit(stmt)
-                    pos += 1
-
-            def _Build__class_getitem_Node(self) -> None:
-                self.__class_getitem__Node = t.cast(ast.Assign, ast.parse(f"__class_getitem__ = classmethod({self.types_import}.GenericAlias)").body[0])
-
-            def visit_ClassDef(self, node: ast.ClassDef) -> None:
-                if node.name in non_subscriptable_classes:
-                    assert self.__class_getitem__Node is not None
-                    node.body.append(self.__class_getitem__Node)
-
-        visitor = NodeVisitor()
-        visitor.visit(tree)
+        visitor = FileTransformer(non_subscriptable_classes)
+        modified_tree = tree.visit(visitor)
         with open(path_to_impl, "w") as f:
-            f.write(ast.unparse(tree))
+            f.write(modified_tree.code)
 
 def compare_dirs(path_to_impl: Path, path_to_stub: Path, *, fix: bool) -> None:
     for p in path_to_stub.iterdir():
